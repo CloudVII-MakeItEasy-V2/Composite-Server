@@ -1,6 +1,8 @@
-Flask==2.0.2
-requests==2.26.0
-python-dotenv==0.19.0
-SQLAlchemy==1.4.22
-PyMySQL==1.0.2
-
+flask
+flask-sqlalchemy
+pymysql
+python-dotenv
+bcrypt
+aiohttp
+requests
+flask-cors

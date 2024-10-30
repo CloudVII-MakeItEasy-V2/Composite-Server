@@ -10,12 +10,13 @@ import aiohttp
 import bcrypt
 from sqlalchemy import text
 import hashlib
-
+from flask_cors import CORS
 # Load environment variables from .env file
 load_dotenv()
-
+baseurl = 'https://makeiteasy-440104.ue.r.appspot.com';
 # Initialize Flask app
 app = Flask(__name__)
+CORS(app)
 app.secret_key = os.getenv('SECRET_KEY')  # Needed for session management
 
 # Configure the database connection using the environment variable
@@ -54,38 +55,54 @@ def verify_password(stored_password_hash, provided_password):
 def customer_login():
     try:
         if request.content_type != 'application/json':
-            return jsonify({"error": "Content-Type must be application/json"}), 415
+            return jsonify({
+                "error": "Content-Type must be application/json",
+                "links": [{"rel": "self", "href": "{baseurl}/customer/login"}]
+            }), 415
 
         data = request.get_json()
         email = data.get('email')
         password = data.get('password')
 
         if not email or not password:
-            return jsonify({"error": "Email and password are required"}), 400
+            return jsonify({
+                "error": "Email and password are required",
+                "links": [{"rel": "self", "href": "/customer/login"}]
+            }), 400
 
         # Use the text function from SQLAlchemy to explicitly declare the query
         query = text("SELECT * FROM Customer WHERE email = :email")
         customer = db.session.execute(query, {"email": email}).fetchone()
 
         if customer:
-            # Debugging log to confirm fetching of customer
             logger.info(f"Customer fetched: {customer}")
 
-            # Access the password hash from the row
             password_hash = customer.password_hash
-
-            # Hash the provided password using SHA-256
             provided_password_hash = hashlib.sha256(password.encode('utf-8')).hexdigest()
 
-            # Verify the password
             if provided_password_hash == password_hash:
                 session['user_id'] = customer.customer_id
-                return jsonify({"state": True, "message": "Login successful"})
+                return jsonify({
+                    "state": True, 
+                    "message": "Login successful",
+                    "links": [
+                        {"rel": "self", "href": f"{baseurl}/customer/login"},
+                        {"rel": "profile", "href": f"{baseurl}/customer/{customer.customer_id}"},
+                        {"rel": "logout", "href": f"{baseurl}/customer/logout"}
+                    ]
+                })
 
-        return jsonify({"state": False, "message": "Incorrect email or password"}), 401
+        return jsonify({
+            "state": False, 
+            "message": "Incorrect email or password",
+            "links": [{"rel": "self", "href": f"{baseurl}/customer/login"}]
+        }), 401
     except Exception as e:
         logger.error(f"Error during login: {e}")
-        return jsonify({"error": "An internal server error occurred"}), 500
+        return jsonify({
+            "error": "An internal server error occurred",
+            "links": [{"rel": "self", "href": f"{baseurl}/customer/login"}]
+        }), 500
 
 
 # GET - Retrieve customer info
@@ -103,7 +120,18 @@ def get_customer_info(customer_id):
                 "name": customer.name,
                 "email": customer.email,
                 "address": customer.address,
-                "phone": customer.phone
+                "phone": customer.phone,
+                "_links": {
+                    "self": {
+                        "href": request.url
+                    },
+                    "orders": {
+                        "href": f"{baseurl}/customer/{customer_id}/orders"
+                    },
+                    "support_tickets": {
+                        "href": f"{baseurl}/customer/{customer_id}/support-tickets"
+                    }
+                }
             }
             return jsonify(customer_info)
         else:
@@ -112,12 +140,10 @@ def get_customer_info(customer_id):
         logger.error(f"Error retrieving customer: {e}")
         return jsonify({'error': 'Failed to retrieve customer information'}), 500
 
-# POST - Create a new customer
-@app.route('/customer', methods=['POST'])
-def create_customer():
+
+'''def create_customer():
     if request.content_type != 'application/json':
         return jsonify({"error": "Content-Type must be application/json"}), 415
-
     data = request.get_json()
     name = data.get('name')
     email = data.get('email')
@@ -130,6 +156,41 @@ def create_customer():
         db.session.commit()
         return jsonify({"message": "Customer created successfully"}), 201
     except Exception as e:
+        return jsonify({"error": str(e)}), 400'''
+# POST - Create a new customer
+@app.route('/customer', methods=['POST'])
+def create_customer():
+    if request.content_type != 'application/json':
+        return jsonify({"error": "Content-Type must be application/json"}), 415
+    data = request.get_json()
+    name = data.get('name')
+    email = data.get('email')
+    address = data.get('address')
+    phone = data.get('phone')
+    password_hash = bcrypt.hashpw(data.get('password').encode('utf-8'), bcrypt.gensalt())
+    
+    try:
+        # Execute SQL to insert the new customer, declared as a text object
+        sql = text("""
+        INSERT INTO Customer (name, email, address, phone, password_hash) 
+        VALUES (:name, :email, :address, :phone, :password_hash);
+        """)
+        db.session.execute(sql, {'name': name, 'email': email, 'address': address, 'phone': phone, 'password_hash': password_hash})
+        db.session.commit()
+        
+        # Retrieve the last inserted ID
+        last_id = db.session.execute(text('SELECT LAST_INSERT_ID();')).scalar()
+
+        # Generate HATEOAS links using the last inserted ID
+        links = [
+            {"rel": "self", "href": f"{baseurl}/customer/{last_id}"},
+            {"rel": "update", "href": f"{baseurl}/customer/{last_id}/update"},
+            {"rel": "delete", "href": f"{baseurl}/customer/{last_id}/delete"}
+        ]
+        return jsonify({"message": "Customer created successfully", "id": last_id, "links": links}), 201
+
+    except Exception as e:
+        db.session.rollback()
         return jsonify({"error": str(e)}), 400
 
 # POST - Create a new order for a customer
@@ -143,7 +204,7 @@ def create_customer_order(customer_id):
     try:
         response = requests.post(f'{order_service_url}/orders', json=order_data)
         if response.status_code == 201:
-            return jsonify(response.json()), 201, {'Location': f'/customer/{customer_id}/orders/{response.json()["order_id"]}'}
+            return jsonify(response.json()), 201, {'Location': f'{baseurl}/{customer_id}/orders/{response.json()["order_id"]}'}
         else:
             return jsonify({'error': 'Failed to create order'}), 400
     except requests.exceptions.RequestException:
@@ -178,8 +239,18 @@ def update_support_ticket(customer_id, ticket_id):
             "customer_id": customer_id
         })
         db.session.commit()
+        # Create HATEOAS links
+        links = [
+            {"rel": "self", "href": f"{baseurl}/customer/{customer_id}/support_tickets/{ticket_id}"},
+            {"rel": "view-all-tickets", "href": f"{baseurl}/customer/{customer_id}/support_tickets"},
+            {"rel": "delete-ticket", "method": "DELETE", "href": f"{baseurl}/customer/{customer_id}/support_tickets/{ticket_id}"}
+        ]
 
-        return jsonify({"ticket_id": ticket_id, "message": "Support ticket updated successfully"})
+        return jsonify({
+            "ticket_id": ticket_id,
+            "message": "Support ticket updated successfully",
+            "links": links
+        })
     except Exception as e:
         logger.error(f"Error updating support ticket: {e}")
         return jsonify({'error': 'An internal server error occurred'}), 500

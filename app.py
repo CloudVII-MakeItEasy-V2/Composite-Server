@@ -50,7 +50,6 @@ def verify_password(stored_password_hash, provided_password):
 
 # Customer login
 
-
 @app.route('/customer/login', methods=['POST'])
 def customer_login():
     try:
@@ -141,22 +140,6 @@ def get_customer_info(customer_id):
         return jsonify({'error': 'Failed to retrieve customer information'}), 500
 
 
-'''def create_customer():
-    if request.content_type != 'application/json':
-        return jsonify({"error": "Content-Type must be application/json"}), 415
-    data = request.get_json()
-    name = data.get('name')
-    email = data.get('email')
-    address = data.get('address')
-    phone = data.get('phone')
-    password_hash = bcrypt.hashpw(data.get('password').encode('utf-8'), bcrypt.gensalt())
-    try:
-        db.session.execute("INSERT INTO Customer (name, email, address, phone, password_hash) VALUES (:name, :email, :address, :phone, :password_hash)", 
-                           {"name": name, "email": email, "address": address, "phone": phone, "password_hash": password_hash})
-        db.session.commit()
-        return jsonify({"message": "Customer created successfully"}), 201
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400'''
 # POST - Create a new customer
 @app.route('/customer', methods=['POST'])
 def create_customer():
@@ -193,33 +176,42 @@ def create_customer():
         db.session.rollback()
         return jsonify({"error": str(e)}), 400
 
-# POST - Create a new order for a customer
 @app.route('/customer/<int:customer_id>/orders', methods=['POST'])
 def create_customer_order(customer_id):
     if request.content_type != 'application/json':
         return jsonify({"error": "Content-Type must be application/json"}), 415
 
-    order_service_url = os.getenv('ORDER_SERVICE_URL')
+    # Environment variable for the order service URL
+    order_service_url = os.getenv('MICROSERVICE2_ORDER_SERVICE_URL')
+    if not order_service_url:
+        return jsonify({"error": "Order service URL is not configured"}), 500
+
     order_data = request.get_json()
+    
+    order_data['customer_id'] = customer_id
+
     try:
-        response = requests.post(f'{order_service_url}/orders', json=order_data)
+        # Post the order data to the order service
+        response = requests.post(f'{order_service_url}/create_order', json=order_data)
         if response.status_code == 201:
-            return jsonify(response.json()), 201, {'Location': f'{baseurl}/{customer_id}/orders/{response.json()["order_id"]}'}
+            order_id = response.json().get("order_id")
+            if order_id:
+                return jsonify(response.json()), 201, {'Location': f'/customer/{customer_id}/orders/{order_id}'}
+            else:
+                return jsonify({"error": "Order ID missing in response"}), 500
         else:
-            return jsonify({'error': 'Failed to create order'}), 400
-    except requests.exceptions.RequestException:
-        return jsonify({'error': 'Failed to connect to order service'}), 500
+            return jsonify({"error": "Failed to create order", "details": response.json()}), response.status_code
+    except requests.exceptions.RequestException as e:
+        return jsonify({'error': 'Failed to connect to order service', 'details': str(e)}), 500
 
 # PUT - Update a support ticket for a customer
 @app.route('/customer/<int:customer_id>/support_tickets/<int:ticket_id>', methods=['PUT'])
 def update_support_ticket(customer_id, ticket_id):
     try:
-        # Get the JSON data from the request
         support_ticket_data = request.get_json()
         issue = support_ticket_data.get('issue')
         status = support_ticket_data.get('status')
 
-        # Check if the support ticket exists for the customer
         query = text("SELECT * FROM SupportTicket WHERE ticket_id = :ticket_id AND customer_id = :customer_id")
         ticket = db.session.execute(query, {"ticket_id": ticket_id, "customer_id": customer_id}).fetchone()
 
@@ -256,32 +248,34 @@ def update_support_ticket(customer_id, ticket_id):
         return jsonify({'error': 'An internal server error occurred'}), 500
 
 
-# GET - Retrieve a customer's orders with query parameters (e.g., status) and pagination
+# GET - Retrieve a customer's orders with query parameters (e.g., customer id) and pagination
 @app.route('/customer/<int:customer_id>/orders', methods=['GET'])
 def get_customer_orders_with_status(customer_id):
-    order_service_url = os.getenv('ORDER_SERVICE_URL')
-    status = request.args.get('status')
+    order_service_url = os.getenv('MICROSERVICE2_ORDER_SERVICE_URL')
     page = request.args.get('page', 1)
     per_page = request.args.get('per_page', 10)
-    
+
     try:
-        if status:
-            response = requests.get(f'{order_service_url}/orders/{customer_id}?status={status}&page={page}&per_page={per_page}')
-        else:
-            response = requests.get(f'{order_service_url}/orders/{customer_id}?page={page}&per_page={per_page}')
-        
+        # Fetching all orders
+        response = requests.get(f'{order_service_url}/orders?page={page}&per_page={per_page}')
         if response.status_code == 200:
-            return jsonify(response.json())
+            all_orders = response.json()
+            
+            # Filtering orders by customer ID
+            filtered_orders = [order for order in all_orders if order['customer_id'] == customer_id]    
+            return jsonify(filtered_orders)
+
         else:
             return jsonify({'error': 'Orders not found'}), 404
+
     except requests.exceptions.RequestException:
         return jsonify({'error': 'Failed to connect to order service'}), 500
 
 # Synchronous call to fetch customer info and orders
 @app.route('/customer/<int:customer_id>/info_and_orders', methods=['GET'])
 def get_customer_info_and_orders_synchronously(customer_id):
-    customer_service_url = os.getenv('CUSTOMER_SERVICE_URL')
-    order_service_url = os.getenv('ORDER_SERVICE_URL')
+    customer_service_url = os.getenv('MIRCROSERVICE1_CUSTOMER_SERVICE_URL')
+    order_service_url = os.getenv('MICROSERVICE2_ORDER_SERVICE_URL')
     
     try:
         customer_response = requests.get(f'{customer_service_url}/customers/{customer_id}')
@@ -310,8 +304,8 @@ async def fetch_customer_orders(session, order_service_url, customer_id):
 
 @app.route('/customer/<int:customer_id>/async_info_and_orders', methods=['GET'])
 async def get_customer_info_and_orders_asynchronously(customer_id):
-    customer_service_url = os.getenv('CUSTOMER_SERVICE_URL')
-    order_service_url = os.getenv('ORDER_SERVICE_URL')
+    customer_service_url = os.getenv('MIRCROSERVICE1_CUSTOMER_SERVICE_URL')
+    order_service_url = os.getenv('MICROSERVICE2_ORDER_SERVICE_URL')
 
     async with aiohttp.ClientSession() as session:
         customer_task = asyncio.create_task(fetch_customer_info(session, customer_service_url, customer_id))

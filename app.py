@@ -1,322 +1,449 @@
-from flask import Flask, jsonify, request, g, session
-from dotenv import load_dotenv
 import os
-import logging
 import time
-from flask_sqlalchemy import SQLAlchemy
+import uuid
+import logging
 import requests
-import asyncio
-import aiohttp
-import bcrypt
-from sqlalchemy import text
-import hashlib
+from flask import Flask, jsonify, request, g
+from dotenv import load_dotenv
 from flask_cors import CORS
-# Load environment variables from .env file
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt
+from functools import wraps
+
 load_dotenv()
-baseurl = 'https://makeiteasy-440104.ue.r.appspot.com';
-# Initialize Flask app
+
 app = Flask(__name__)
 CORS(app)
-app.secret_key = os.getenv('SECRET_KEY')  # Needed for session management
 
-# Configure the database connection using the environment variable
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')
-db = SQLAlchemy(app)
+app.secret_key = os.getenv('SECRET_KEY', 'default_secret')
+app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'default_jwt_secret')
+jwt = JWTManager(app)
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-@app.route('/')
-def index():
-    return jsonify({"message": "Composite Microservice is running!"})
+# Services
+order_service_url = os.getenv('MICROSERVICE2_ORDER_SERVICE_URL', 'http://host.docker.internal:8001')
+seller_service_url = os.getenv('MICROSERVICE3_SELLER_SERVICE_URL', 'http://host.docker.internal:8000')
+customer_service_url = os.getenv('MICROSERVICE1_CUSTOMER_SERVICE_URL')  # Only if available
 
-# Middleware to log before each request
+SMART_STREET_API_URL = os.getenv('SMART_STREET_API_URL', 'https://api.smartystreets.com/street-address')
+SMART_STREET_AUTH_ID = os.getenv('SMART_STREET_AUTH_ID')
+SMART_STREET_AUTH_TOKEN = os.getenv('SMART_STREET_AUTH_TOKEN')
+# SMART_STREET_NAME not needed for direct API call, but we keep it if needed
+SMART_STREET_NAME = os.getenv('SMART_STREET_NAME', 'makeiteasy')
+
+DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL')  # set in .env if you want notifications
+
+baseurl = 'http://127.0.0.1:8080'
+
 @app.before_request
 def before_request_logging():
     g.start_time = time.time()
-    logger.info(f"Before Request - Method: {request.method} Path: {request.path}")
+    correlation_id = request.headers.get('X-Correlation-ID', str(uuid.uuid4()))
+    g.correlation_id = correlation_id
+    logger.info(f"Correlation ID: {correlation_id} - Before Request: {request.method} {request.path}")
 
-# Middleware to log after each request
 @app.after_request
 def after_request_logging(response):
     duration = time.time() - g.start_time
-    logger.info(f"After Request - Method: {request.method} Path: {request.path} Status: {response.status_code} Duration: {duration:.4f}s")
+    response.headers['X-Correlation-ID'] = g.correlation_id
     return response
 
-# Helper function to verify password
-def verify_password(stored_password_hash, provided_password):
-    return bcrypt.checkpw(provided_password.encode('utf-8'), stored_password_hash)
+@app.errorhandler(400)
+def bad_request(error):
+    return jsonify({"error": "Bad Request", "message": str(error)}), 400
 
-# Customer login
+@app.errorhandler(401)
+def unauthorized(error):
+    return jsonify({"error": "Unauthorized", "message": str(error)}), 401
 
-@app.route('/customer/login', methods=['POST'])
-def customer_login():
-    try:
-        if request.content_type != 'application/json':
-            return jsonify({
-                "error": "Content-Type must be application/json",
-                "links": [{"rel": "self", "href": "{baseurl}/customer/login"}]
-            }), 415
+@app.errorhandler(403)
+def forbidden(error):
+    return jsonify({"error": "Forbidden", "message": "Insufficient grants"}), 403
 
-        data = request.get_json()
-        email = data.get('email')
-        password = data.get('password')
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({"error": "Not Found", "message": str(error)}), 404
 
-        if not email or not password:
-            return jsonify({
-                "error": "Email and password are required",
-                "links": [{"rel": "self", "href": "/customer/login"}]
-            }), 400
+@app.errorhandler(415)
+def unsupported_media_type(error):
+    return jsonify({"error": "Unsupported Media Type", "message": str(error)}), 415
 
-        # Use the text function from SQLAlchemy to explicitly declare the query
-        query = text("SELECT * FROM Customer WHERE email = :email")
-        customer = db.session.execute(query, {"email": email}).fetchone()
+@app.errorhandler(500)
+def internal_server_error(error):
+    return jsonify({"error": "Internal Server Error", "message": str(error)}), 500
 
-        if customer:
-            logger.info(f"Customer fetched: {customer}")
+@app.route('/')
+def index():
+    return jsonify({"message": "Composite Microservice is running!"}), 200
 
-            password_hash = customer.password_hash
-            provided_password_hash = hashlib.sha256(password.encode('utf-8')).hexdigest()
+@app.route('/auth/token', methods=['POST'])
+def issue_token():
+    data = request.get_json()
+    username = data.get('username', 'guest')
+    grants = data.get('grants', [])
+    additional_claims = {"grants": grants}
+    access_token = create_access_token(identity=username, additional_claims=additional_claims)
+    return jsonify({"access_token": access_token}), 200
 
-            if provided_password_hash == password_hash:
-                session['user_id'] = customer.customer_id
-                return jsonify({
-                    "state": True, 
-                    "message": "Login successful",
-                    "links": [
-                        {"rel": "self", "href": f"{baseurl}/customer/login"},
-                        {"rel": "profile", "href": f"{baseurl}/customer/{customer.customer_id}"},
-                        {"rel": "logout", "href": f"{baseurl}/customer/logout"}
-                    ]
-                })
+def grants_required(required_grant):
+    def decorator(fn):
+        @wraps(fn)
+        @jwt_required()
+        def wrapper(*args, **kwargs):
+            claims = get_jwt()
+            user_grants = claims.get('grants', [])
+            if required_grant not in user_grants:
+                return jsonify({"error": "Forbidden", "message": "Insufficient grants"}), 403
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
 
-        return jsonify({
-            "state": False, 
-            "message": "Incorrect email or password",
-            "links": [{"rel": "self", "href": f"{baseurl}/customer/login"}]
-        }), 401
-    except Exception as e:
-        logger.error(f"Error during login: {e}")
-        return jsonify({
-            "error": "An internal server error occurred",
-            "links": [{"rel": "self", "href": f"{baseurl}/customer/login"}]
-        }), 500
-
-
-# GET - Retrieve customer info
-@app.route('/customer/<int:customer_id>', methods=['GET'])
-def get_customer_info(customer_id):
-    try:
-        # Directly query the Customer table for the given customer_id
-        query = text("SELECT * FROM Customer WHERE customer_id = :customer_id")
-        customer = db.session.execute(query, {"customer_id": customer_id}).fetchone()
-        
-        if customer:
-            # Construct the customer info dictionary from the fetched row
-            customer_info = {
-                "customer_id": customer.customer_id,
-                "name": customer.name,
-                "email": customer.email,
-                "address": customer.address,
-                "phone": customer.phone,
-                "_links": {
-                    "self": {
-                        "href": request.url
-                    },
-                    "orders": {
-                        "href": f"{baseurl}/customer/{customer_id}/orders"
-                    },
-                    "support_tickets": {
-                        "href": f"{baseurl}/customer/{customer_id}/support-tickets"
-                    }
-                }
-            }
-            return jsonify(customer_info)
-        else:
-            return jsonify({'error': 'Customer not found'}), 404
-    except Exception as e:
-        logger.error(f"Error retrieving customer: {e}")
-        return jsonify({'error': 'Failed to retrieve customer information'}), 500
-
-
-# POST - Create a new customer
-@app.route('/customer', methods=['POST'])
-def create_customer():
+##########################
+# SELLER INTEGRATION     #
+##########################
+@app.route('/seller/register', methods=['POST'])
+@jwt_required()
+@grants_required('register_seller')
+def register_seller():
     if request.content_type != 'application/json':
         return jsonify({"error": "Content-Type must be application/json"}), 415
+    if not seller_service_url:
+        return jsonify({"error": "Seller service URL is not configured"}), 500
+
     data = request.get_json()
     name = data.get('name')
     email = data.get('email')
-    address = data.get('address')
-    phone = data.get('phone')
-    password_hash = bcrypt.hashpw(data.get('password').encode('utf-8'), bcrypt.gensalt())
-    
-    try:
-        # Execute SQL to insert the new customer, declared as a text object
-        sql = text("""
-        INSERT INTO Customer (name, email, address, phone, password_hash) 
-        VALUES (:name, :email, :address, :phone, :password_hash);
-        """)
-        db.session.execute(sql, {'name': name, 'email': email, 'address': address, 'phone': phone, 'password_hash': password_hash})
-        db.session.commit()
-        
-        # Retrieve the last inserted ID
-        last_id = db.session.execute(text('SELECT LAST_INSERT_ID();')).scalar()
+    if not name or not email:
+        return jsonify({"error": "Name and email are required"}), 400
 
-        # Generate HATEOAS links using the last inserted ID
-        links = [
-            {"rel": "self", "href": f"{baseurl}/customer/{last_id}"},
-            {"rel": "update", "href": f"{baseurl}/customer/{last_id}/update"},
-            {"rel": "delete", "href": f"{baseurl}/customer/{last_id}/delete"}
-        ]
-        return jsonify({"message": "Customer created successfully", "id": last_id, "links": links}), 201
+    headers = {
+        'Content-Type': 'application/json',
+        'X-Correlation-ID': g.correlation_id,
+        'Authorization': request.headers.get('Authorization')
+    }
 
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 400
+    response = requests.post(f'{seller_service_url}/seller/register', json=data, headers=headers)
+    if response.status_code == 201:
+        resp_json = response.json()
+        seller_id = resp_json['seller']['id']
+        resp = jsonify(resp_json)
+        resp.status_code = 201
+        resp.headers['Location'] = f"{baseurl}/seller/{seller_id}"
+        return resp
+    else:
+        return jsonify({"error": "Failed to register seller", "details": response.text}), response.status_code
 
+@app.route('/seller/<int:seller_id>/products', methods=['POST'])
+@jwt_required()
+@grants_required('create_product')
+def create_seller_product(seller_id):
+    if request.content_type != 'application/json':
+        return jsonify({"error": "Content-Type must be application/json"}), 415
+    if not seller_service_url:
+        return jsonify({"error": "Seller service URL is not configured"}), 500
+
+    product_data = request.get_json()
+    product_data['seller_id'] = seller_id
+
+    headers = {
+        'Content-Type': 'application/json',
+        'X-Correlation-ID': g.correlation_id,
+        'Authorization': request.headers.get('Authorization')
+    }
+
+    response = requests.post(f'{seller_service_url}/product', json=product_data, headers=headers)
+    if response.status_code == 201:
+        resp_json = response.json()
+        product_id = resp_json.get("product_id")
+        if product_id:
+            resp = jsonify(resp_json)
+            resp.status_code = 201
+            resp.headers['Location'] = f"{baseurl}/product/{product_id}"
+            return resp
+        else:
+            return jsonify({"error": "Product ID missing in response"}), 500
+    else:
+        return jsonify({"error": "Failed to create product", "details": response.text}), response.status_code
+
+##########################
+# ORDER INTEGRATION      #
+##########################
 @app.route('/customer/<int:customer_id>/orders', methods=['POST'])
+@jwt_required()
+@grants_required('create_order')
 def create_customer_order(customer_id):
     if request.content_type != 'application/json':
         return jsonify({"error": "Content-Type must be application/json"}), 415
-
-    # Environment variable for the order service URL
-    order_service_url = os.getenv('MICROSERVICE2_ORDER_SERVICE_URL')
     if not order_service_url:
         return jsonify({"error": "Order service URL is not configured"}), 500
 
     order_data = request.get_json()
-    
     order_data['customer_id'] = customer_id
 
-    try:
-        # Post the order data to the order service
-        response = requests.post(f'{order_service_url}/create_order', json=order_data)
+    headers = {
+        'Content-Type': 'application/json',
+        'X-Correlation-ID': g.correlation_id,
+        'Authorization': request.headers.get('Authorization')
+    }
+
+    if 'callback_url' in order_data:
+        response = requests.post(f'{order_service_url}/create_order/async', json=order_data, headers=headers)
+        if response.status_code == 202:
+            # If callback_url scenario: send a notification
+            trigger_end_user_notification(order_id=None)
+            return jsonify({"message": "Order processing accepted"}), 202
+        else:
+            return jsonify({"error": "Failed to create order asynchronously", "details": response.text}), response.status_code
+    else:
+        response = requests.post(f'{order_service_url}/create_order', json=order_data, headers=headers)
         if response.status_code == 201:
-            order_id = response.json().get("order_id")
+            resp_json = response.json()
+            order_id = resp_json.get("order_id")
             if order_id:
-                return jsonify(response.json()), 201, {'Location': f'/customer/{customer_id}/orders/{order_id}'}
+                publish_order_event(order_id)
+                # Automatically send Discord notification when an order is created
+                trigger_end_user_notification(order_id)
+                resp = jsonify(resp_json)
+                resp.status_code = 201
+                resp.headers['Location'] = f"{baseurl}/customer/{customer_id}/orders/{order_id}"
+                return resp
             else:
                 return jsonify({"error": "Order ID missing in response"}), 500
         else:
-            return jsonify({"error": "Failed to create order", "details": response.json()}), response.status_code
-    except requests.exceptions.RequestException as e:
-        return jsonify({'error': 'Failed to connect to order service', 'details': str(e)}), 500
+            return jsonify({"error": "Failed to create order", "details": response.text}), response.status_code
 
-# PUT - Update a support ticket for a customer
-@app.route('/customer/<int:customer_id>/support_tickets/<int:ticket_id>', methods=['PUT'])
-def update_support_ticket(customer_id, ticket_id):
-    try:
-        support_ticket_data = request.get_json()
-        issue = support_ticket_data.get('issue')
-        status = support_ticket_data.get('status')
-
-        query = text("SELECT * FROM SupportTicket WHERE ticket_id = :ticket_id AND customer_id = :customer_id")
-        ticket = db.session.execute(query, {"ticket_id": ticket_id, "customer_id": customer_id}).fetchone()
-
-        if not ticket:
-            return jsonify({'error': 'Support ticket not found'}), 404
-
-        # Update the support ticket
-        update_query = text("""
-            UPDATE SupportTicket
-            SET issue = :issue, status = :status
-            WHERE ticket_id = :ticket_id AND customer_id = :customer_id
-        """)
-        db.session.execute(update_query, {
-            "issue": issue,
-            "status": status,
-            "ticket_id": ticket_id,
-            "customer_id": customer_id
-        })
-        db.session.commit()
-        # Create HATEOAS links
-        links = [
-            {"rel": "self", "href": f"{baseurl}/customer/{customer_id}/support_tickets/{ticket_id}"},
-            {"rel": "view-all-tickets", "href": f"{baseurl}/customer/{customer_id}/support_tickets"},
-            {"rel": "delete-ticket", "method": "DELETE", "href": f"{baseurl}/customer/{customer_id}/support_tickets/{ticket_id}"}
-        ]
-
-        return jsonify({
-            "ticket_id": ticket_id,
-            "message": "Support ticket updated successfully",
-            "links": links
-        })
-    except Exception as e:
-        logger.error(f"Error updating support ticket: {e}")
-        return jsonify({'error': 'An internal server error occurred'}), 500
-
-
-# GET - Retrieve a customer's orders with query parameters (e.g., customer id) and pagination
 @app.route('/customer/<int:customer_id>/orders', methods=['GET'])
+@jwt_required()
+@grants_required('view_order')
 def get_customer_orders_with_status(customer_id):
-    order_service_url = os.getenv('MICROSERVICE2_ORDER_SERVICE_URL')
+    if not order_service_url:
+        return jsonify({"error": "Order service URL is not configured"}), 500
+
     page = request.args.get('page', 1)
     per_page = request.args.get('per_page', 10)
 
-    try:
-        # Fetching all orders
-        response = requests.get(f'{order_service_url}/orders?page={page}&per_page={per_page}')
-        if response.status_code == 200:
-            all_orders = response.json()
-            
-            # Filtering orders by customer ID
-            filtered_orders = [order for order in all_orders if order['customer_id'] == customer_id]    
-            return jsonify(filtered_orders)
+    headers = {
+        'X-Correlation-ID': g.correlation_id,
+        'Authorization': request.headers.get('Authorization')
+    }
 
-        else:
-            return jsonify({'error': 'Orders not found'}), 404
+    params = {
+        'customer_id': customer_id,
+        'page': page,
+        'page_size': per_page
+    }
 
-    except requests.exceptions.RequestException:
-        return jsonify({'error': 'Failed to connect to order service'}), 500
+    response = requests.get(f'{order_service_url}/orders', headers=headers, params=params)
+    if response.status_code == 200:
+        orders = response.json()
+        next_page = int(page) + 1
+        prev_page = int(page) - 1 if int(page) > 1 else None
+        links = {
+            "self": {"href": f"{request.base_url}?page={page}&per_page={per_page}"},
+            "next": {"href": f"{request.base_url}?page={next_page}&per_page={per_page}"}
+        }
+        if prev_page:
+            links["prev"] = {"href": f"{request.base_url}?page={prev_page}&per_page={per_page}"}
+        return jsonify({"orders": orders, "links": links}), 200
+    else:
+        return jsonify({'error': 'Failed to retrieve orders', 'details': response.text}), response.status_code
 
-# Synchronous call to fetch customer info and orders
-@app.route('/customer/<int:customer_id>/info_and_orders', methods=['GET'])
-def get_customer_info_and_orders_synchronously(customer_id):
-    customer_service_url = os.getenv('MIRCROSERVICE1_CUSTOMER_SERVICE_URL')
-    order_service_url = os.getenv('MICROSERVICE2_ORDER_SERVICE_URL')
-    
-    try:
-        customer_response = requests.get(f'{customer_service_url}/customers/{customer_id}')
-        if customer_response.status_code != 200:
-            return jsonify({'error': 'Customer not found'}), 404
+@app.route('/customer/<int:customer_id>/orders/<int:order_id>', methods=['GET'])
+@jwt_required()
+@grants_required('view_order')
+def get_single_order(customer_id, order_id):
+    if not order_service_url:
+        return jsonify({"error": "Order service URL is not configured"}), 500
 
-        orders_response = requests.get(f'{order_service_url}/orders/{customer_id}')
-        if orders_response.status_code != 200:
-            return jsonify({'error': 'Orders not found'}), 404
+    headers = {
+        'X-Correlation-ID': g.correlation_id,
+        'Authorization': request.headers.get('Authorization')
+    }
 
-        return jsonify({
-            'customer': customer_response.json(),
-            'orders': orders_response.json()
-        })
-    except requests.exceptions.RequestException:
-        return jsonify({'error': 'Failed to connect to services'}), 500
+    response = requests.get(f'{order_service_url}/orders/{order_id}', headers=headers)
+    if response.status_code == 200:
+        order_info = response.json()
+        if '_links' not in order_info:
+            order_info['_links'] = {
+                "self": {"href": request.url},
+                "customer": {"href": f"{baseurl}/customer/{customer_id}"}
+            }
+        return jsonify(order_info), 200
+    elif response.status_code == 404:
+        return jsonify({'error': 'Order not found'}), 404
+    else:
+        return jsonify({'error': 'Failed to retrieve order', 'details': response.text}), response.status_code
 
-# Asynchronous method to fetch customer info and orders
-async def fetch_customer_info(session, customer_service_url, customer_id):
-    async with session.get(f'{customer_service_url}/customers/{customer_id}') as response:
-        return await response.json()
+@app.route('/customer/<int:customer_id>/orders/<int:order_id>/status', methods=['GET'])
+@jwt_required()
+@grants_required('view_order')
+def get_async_order_status(customer_id, order_id):
+    if not order_service_url:
+        return jsonify({"error": "Order service URL is not configured"}), 500
 
-async def fetch_customer_orders(session, order_service_url, customer_id):
-    async with session.get(f'{order_service_url}/orders/{customer_id}') as response:
-        return await response.json()
+    headers = {
+        'X-Correlation-ID': g.correlation_id,
+        'Authorization': request.headers.get('Authorization')
+    }
 
-@app.route('/customer/<int:customer_id>/async_info_and_orders', methods=['GET'])
-async def get_customer_info_and_orders_asynchronously(customer_id):
-    customer_service_url = os.getenv('MIRCROSERVICE1_CUSTOMER_SERVICE_URL')
-    order_service_url = os.getenv('MICROSERVICE2_ORDER_SERVICE_URL')
+    response = requests.get(f'{order_service_url}/callback/{order_id}/status', headers=headers)
+    if response.status_code == 200:
+        return jsonify(response.json()), 200
+    elif response.status_code == 404:
+        return jsonify({'error': 'Order not found'}), 404
+    else:
+        return jsonify({'error': 'Failed to retrieve order status', 'details': response.text}), response.status_code
 
-    async with aiohttp.ClientSession() as session:
-        customer_task = asyncio.create_task(fetch_customer_info(session, customer_service_url, customer_id))
-        orders_task = asyncio.create_task(fetch_customer_orders(session, order_service_url, customer_id))
+def publish_order_event(order_id):
+    logger.info(f"Publishing order_created event for order_id={order_id}")
 
-        customer_info, customer_orders = await asyncio.gather(customer_task, orders_task)
+def trigger_end_user_notification(order_id):
+    if DISCORD_WEBHOOK_URL:
+        message = {"content": f"Order has been received and is being processed! Order ID: {order_id}"}
+        try:
+            response = requests.post(DISCORD_WEBHOOK_URL, json=message)
+            if response.status_code not in [200,204]:
+                logger.error(f"Discord webhook failed with status {response.status_code}: {response.text}")
+        except Exception as e:
+            logger.error(f"Failed to send notification: {e}")
+    else:
+        logger.info("No DISCORD_WEBHOOK_URL set, skipping notification")
 
-        return jsonify({
-            'customer': customer_info,
-            'orders': customer_orders
-        })
+#############################
+# CUSTOMER INTEGRATION 
+# Keep this code as is 
+# GPT写的框架 没连接上db 
+#############################
+'''
+@app.route('/customer/register', methods=['POST'])
+@jwt_required()
+@grants_required('register_customer')
+def register_customer():
+    if request.content_type != 'application/json':
+        return jsonify({"error": "Content-Type must be application/json"}), 415
+    if not customer_service_url:
+        return jsonify({"error": "Customer service URL is not configured"}), 500
+
+    data = request.get_json()
+    name = data.get('name')
+    email = data.get('email')
+    if not name or not email:
+        return jsonify({"error": "Name and email are required"}), 400
+
+    headers = {
+        'Content-Type': 'application/json',
+        'X-Correlation-ID': g.correlation_id,
+        'Authorization': request.headers.get('Authorization')
+    }
+
+    response = requests.post(f'{customer_service_url}/customer/register', json=data, headers=headers)
+    if response.status_code == 201:
+        resp_json = response.json()
+        customer_id = resp_json['customer']['id']
+        resp = jsonify(resp_json)
+        resp.status_code = 201
+        resp.headers['Location'] = f"{baseurl}/customer/{customer_id}"
+        return resp
+    else:
+        return jsonify({"error": "Failed to register customer", "details": response.text}), response.status_code
+
+@app.route('/customer/<int:customer_id>', methods=['GET'])
+@jwt_required()
+@grants_required('view_customer')
+def get_customer(customer_id):
+    if not customer_service_url:
+        return jsonify({"error": "Customer service URL is not configured"}), 500
+
+    headers = {
+        'X-Correlation-ID': g.correlation_id,
+        'Authorization': request.headers.get('Authorization')
+    }
+
+    response = requests.get(f'{customer_service_url}/customer/{customer_id}', headers=headers)
+    if response.status_code == 200:
+        customer_info = response.json()
+        if '_links' not in customer_info:
+            customer_info['_links'] = {
+                "self": {"href": request.url}
+            }
+        return jsonify(customer_info), 200
+    elif response.status_code == 404:
+        return jsonify({"error": "Customer not found"}), 404
+    else:
+        return jsonify({"error": "Failed to retrieve customer", "details": response.text}), response.status_code
+'''
+
+#############################
+# SMART STREET INTEGRATION  #
+#############################
+def verify_address_with_smart_street(address_data):
+    """Middleware-like function to verify address with Smart Street (SmartyStreets) via GET and query params."""
+    params = {
+        'auth-id': SMART_STREET_AUTH_ID,
+        'auth-token': SMART_STREET_AUTH_TOKEN,
+        'street': address_data.get('street'),
+        'city': address_data.get('city'),
+        'state': address_data.get('state')
+    }
+    if address_data.get('zipcode'):
+        params['zipcode'] = address_data.get('zipcode')
+
+    # No special headers needed for auth, just query params
+    headers = {
+        'X-Correlation-ID': g.correlation_id,
+        'Authorization': request.headers.get('Authorization')
+    }
+
+    response = requests.get(SMART_STREET_API_URL, params=params, headers=headers)
+    if response.status_code == 200:
+        return response.json(), None
+    else:
+        return None, (f"Failed to verify address: {response.text}", response.status_code)
+
+@app.route('/address/verify', methods=['POST'])
+@jwt_required()
+@grants_required('verify_address')
+def address_verify():
+    if request.content_type != 'application/json':
+        return jsonify({"error": "Content-Type must be application/json"}), 415
+
+    address_data = request.get_json()
+    verified_data, error = verify_address_with_smart_street(address_data)
+    if error:
+        message, code = error
+        return jsonify({"error": message}), code
+
+    return jsonify(verified_data), 200
+
+# Test Discord endpoint (just for debugging)
+@app.route('/test_discord', methods=['GET'])
+def test_discord():
+    trigger_end_user_notification(order_id=999)
+    return jsonify({"message": "Discord notification test triggered"}), 200
+
+# CQRS with GraphQL using Graphene 3 and graphql-server beta
+from graphql_server.flask import GraphQLView
+from graphene import ObjectType, String, Int, List, Schema
+
+class ProductType(ObjectType):
+    product_id = Int()
+    name = String()
+    price = String()
+    stock = Int()
+
+class CompositeQuery(ObjectType):
+    products = List(ProductType)
+    def resolve_products(root, info):
+        return [
+            ProductType(product_id=1, name="Test Product", price="19.99", stock=50)
+        ]
+
+schema = Schema(query=CompositeQuery)
+app.add_url_rule('/graphql', view_func=GraphQLView.as_view(
+    'graphql', schema=schema, graphiql=True
+))
 
 if __name__ == '__main__':
+    logger.info("Starting Composite Microservice on http://0.0.0.0:8080/")
     app.run(host='0.0.0.0', port=8080)

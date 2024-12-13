@@ -1,14 +1,23 @@
+runtime: custom  # Replace with the latest supported runtime for Flexible Environment
 env: flex
-runtime: custom
+entrypoint: gunicorn -b :$PORT main:app  # Replace with your actual app entry point
 
-automatic_scaling:
-  min_num_instances: 1
-  max_num_instances: 5
-
+# Configure resources
 resources:
   cpu: 1
   memory_gb: 0.5
   disk_size_gb: 10
 
-network:
-  session_affinity: true
+liveness_check:
+  path: "/"
+  check_interval_sec: 5
+  timeout_sec: 4
+  failure_threshold: 2
+  success_threshold: 1
+
+readiness_check:
+  path: "/"
+  check_interval_sec: 5
+  timeout_sec: 4
+  failure_threshold: 2
+  success_threshold: 1

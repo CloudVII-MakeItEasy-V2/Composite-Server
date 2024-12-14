@@ -13,6 +13,7 @@ from google.cloud import pubsub_v1  # Google Cloud Pub/Sub
 from google.oauth2 import id_token  # For Google Workflows
 from google.oauth2 import service_account
 import google.auth.transport.requests
+from graphql import graphql_sync
 from graphene import ObjectType, String, Int, List
 import base64
 import json
@@ -206,6 +207,7 @@ def login_customer():
             })
             response.headers['Authorization'] = f"Bearer {access_token}"  # Add token to headers
             response.headers['X-Grants'] = ','.join(all_grants)  # Add grants to headers
+            logger.info(response_data)
             return response, 200
 
         elif response.status_code == 401:
@@ -376,39 +378,45 @@ def get_customer(customer_id):
         # Handle network errors or connection issues
         logging.error(f"Failed to connect to Customer Service: {str(e)}")
         return jsonify({"error": "Failed to connect to Customer Service", "details": str(e)}), 500
-    
-def publish_order_event(order_id, customer_id=None, items=None):
-    logger.info(f"Publishing order_created event for order_id={order_id}")
-    if GOOGLE_PUBSUB_TOPIC:
-        message = {
-            "event": "order_created",
-            "order_id": order_id,
-            "customer_id": customer_id,
-            "items": items
-        }
-        try:
-            # Use json.dumps for valid JSON encoding
-            future = pubsub_publisher.publish(
-                GOOGLE_PUBSUB_TOPIC,
-                data=json.dumps(message).encode("utf-8"),  # Proper JSON encoding
-                event="order_created",
-                order_id=str(order_id)
-            )
-            message_id = future.result()
-            logger.info(f"Event published to Pub/Sub successfully. Message ID: {message_id}")
-        except Exception as e:
-            logger.error(f"Error publishing to Pub/Sub: {e}")
-    else:
-        logger.warning("Pub/Sub topic not configured.")
 
-import json
-import requests
-import logging
-from google.oauth2 import service_account
-import google.auth.transport.requests
+def poll_workflow_execution(execution_name, headers, max_retries=30, sleep_time=5):
+    """
+    Polls the workflow execution result until it completes.
+    """
+    execution_url = f"https://workflowexecutions.googleapis.com/v1/{execution_name}"
 
-# Initialize logger
-logger = logging.getLogger(__name__)
+    for attempt in range(max_retries):
+        # Get the current execution state
+        response = requests.get(execution_url, headers=headers)
+
+        if response.status_code != 200:
+            logger.error(f"Failed to fetch workflow execution status: {response.text}")
+            return {"error": "Failed to fetch workflow execution status", "details": response.text}, response.status_code
+
+        execution_data = response.json()
+
+        # Check the execution state
+        state = execution_data.get("state")
+        logger.info(f"Workflow execution state: {state}")
+
+        if state == "SUCCEEDED":
+            # Return the final result of the workflow
+            output = json.loads(execution_data.get("result", "{}"))
+            logger.info(f"Workflow execution succeeded. Output: {output}")
+            return output, 200
+        elif state in ["FAILED", "CANCELLED", "TERMINATED"]:
+            logger.error(f"Workflow execution failed. State: {state}, Error: {execution_data.get('error', {})}")
+            return {
+                "error": f"Workflow execution {state.lower()}",
+                "details": execution_data.get("error", {}),
+            }, 500
+
+        # Wait before polling again
+        time.sleep(sleep_time)
+
+    # If the workflow does not complete within the maximum retries
+    logger.error("Workflow execution did not complete within the maximum retries")
+    return {"error": "Workflow execution timeout"}, 504
 
 def call_step_function_workflow(order_data):
     if GCP_WORKFLOW_URL:
@@ -465,46 +473,6 @@ def call_step_function_workflow(order_data):
     else:
         logger.error("GCP_WORKFLOW_URL is not configured")
         return {"error": "GCP_WORKFLOW_URL is not configured"}, 500
-
-
-def poll_workflow_execution(execution_name, headers, max_retries=30, sleep_time=5):
-    """
-    Polls the workflow execution result until it completes.
-    """
-    execution_url = f"https://workflowexecutions.googleapis.com/v1/{execution_name}"
-
-    for attempt in range(max_retries):
-        # Get the current execution state
-        response = requests.get(execution_url, headers=headers)
-
-        if response.status_code != 200:
-            logger.error(f"Failed to fetch workflow execution status: {response.text}")
-            return {"error": "Failed to fetch workflow execution status", "details": response.text}, response.status_code
-
-        execution_data = response.json()
-
-        # Check the execution state
-        state = execution_data.get("state")
-        logger.info(f"Workflow execution state: {state}")
-
-        if state == "SUCCEEDED":
-            # Return the final result of the workflow
-            output = json.loads(execution_data.get("result", "{}"))
-            logger.info(f"Workflow execution succeeded. Output: {output}")
-            return output, 200
-        elif state in ["FAILED", "CANCELLED", "TERMINATED"]:
-            logger.error(f"Workflow execution failed. State: {state}, Error: {execution_data.get('error', {})}")
-            return {
-                "error": f"Workflow execution {state.lower()}",
-                "details": execution_data.get("error", {}),
-            }, 500
-
-        # Wait before polling again
-        time.sleep(sleep_time)
-
-    # If the workflow does not complete within the maximum retries
-    logger.error("Workflow execution did not complete within the maximum retries")
-    return {"error": "Workflow execution timeout"}, 504
 
 def notify_via_pubsub(event, context):
     """Triggered from a Pub/Sub topic."""
@@ -649,238 +617,121 @@ def publish_order_notification_event(order_id, customer_id=None, items=None):
 @jwt_required()
 @grants_required('create_order')
 def create_customer_order(customer_id):
-    try:
-        # Log the endpoint invocation
-        app.logger.debug(f"create_customer_order endpoint called for customer_id: {customer_id}")
-
-        # Check if the Content-Type is application/json
-        if request.content_type != 'application/json':
-            app.logger.warning(f"Unsupported Media Type: Received Content-Type: {request.content_type}")
-            return jsonify({"error": "Unsupported Media Type", "message": "Use application/json"}), 415
-
-        # Parse the JSON payload
-        try:
-            order_data = request.get_json(force=True)
-            app.logger.info(f"Order data received: {order_data}")
-        except Exception as e:
-            app.logger.warning(f"Failed to parse JSON from request body: {str(e)}", exc_info=True)
-            return jsonify({"error": "Invalid JSON payload", "message": "Request body must be valid JSON"}), 400
-
-        # Ensure `items` are included in the payload and validate their structure
-        if not order_data.get("items") or not isinstance(order_data["items"], list):
-            return jsonify({"error": "Invalid input", "message": "'items' field must be a list"}), 400
-
-        # Validate that each item contains the required fields
-        for item in order_data["items"]:
-            if not all(key in item for key in ["product_id", "quantity", "price"]):
-                return jsonify({
-                    "error": "Invalid input",
-                    "message": "Each item must include 'product_id', 'quantity', and 'price'"
-                }), 400
-
-        # Add customer_id to the payload
-        order_data["customer_id"] = customer_id
-
-        # Ensure the payload includes the required fields for the workflow
-        order_data.setdefault("status", "Pending")  # Default status
-        order_data.setdefault("tracking_number", "")  # Default empty tracking number
-
-        # Log the validated order data
-        app.logger.info(f"Validated order data: {order_data}")
-
-        # Trigger Google Cloud Workflow
-        workflow_response, status_code = call_step_function_workflow(order_data)
-
-        # Handle workflow response
-        if status_code not in [200, 202]:
-            app.logger.error(f"Workflow invocation failed: {workflow_response.get('error')}")
-            return jsonify({"error": "Workflow invocation failed", "details": workflow_response.get("error")}), 502
-
-        # Extract the order_id from the workflow response
-        order_id = workflow_response.get("order_id")
-        if not order_id:
-            app.logger.error("Workflow response did not contain order_id")
-            return jsonify({"error": "Workflow response error", "message": "Missing order_id in response"}), 500
-
-        # Publish an order notification event (optional)
-        publish_order_notification_event(order_id, customer_id, order_data.get("items"))
-        app.logger.info(f"Order notification published for order_id: {order_id}")
-
-        # Return the workflow result as the response with headers
-        response = jsonify({"message": "Order created successfully", "order_id": order_id})
-        response.status_code = 201
-        response.headers['Authorization'] = request.headers.get('Authorization', '')
-        response.headers['Grants'] = request.headers.get('Grants', '')
-        response.headers['Location'] = f"{baseurl}/customer/{customer_id}/orders/{order_id}"
-        return response
-
-    except Exception as e:
-        app.logger.critical(f"Unexpected error in create_customer_order: {str(e)}", exc_info=True)
-        return jsonify({"error": "An internal server error occurred"}), 500
-'''
-@app.route('/customer/<int:customer_id>/orders', methods=['POST'])
-@jwt_required()
-@grants_required('create_order')
-def create_customer_order(customer_id):
-    try:
-        # Log when the endpoint is called
-        app.logger.debug(f"create_customer_order endpoint called for customer_id: {customer_id}")
-
-        # Check if the Content-Type is application/json
-        if request.content_type != 'application/json':
-            app.logger.error(f"Unsupported Media Type: Received Content-Type: {request.content_type}")
-            return jsonify({"error": "Unsupported Media Type", "message": "Use application/json"}), 415
-
-        # Validate that the order service URL is configured
-        if not order_service_url:
-            app.logger.error("Order service URL is not configured")
-            return jsonify({"error": "Order service URL is not configured"}), 500
-
-        # Log incoming request headers
-        app.logger.debug(f"Request headers: {dict(request.headers)}")
-
-        # Log the raw request body
-        app.logger.debug(f"Raw request body: {request.get_data(as_text=True)}")
-
-        # Parse the JSON payload
-        try:
-            order_data = request.get_json(force=True)
-            app.logger.debug(f"Order data received: {order_data}")
-        except Exception as e:
-            app.logger.error(f"Failed to parse JSON from request body: {str(e)}", exc_info=True)
-            return jsonify({"error": "Invalid JSON payload", "message": "Request body must be valid JSON"}), 400
-
-        # Add customer_id to the payload
-        order_data['customer_id'] = customer_id
-
-        # Validate that 'items' is present and is a list
-        if not order_data.get('items') or not isinstance(order_data['items'], list):
-            app.logger.error("Invalid order data: 'items' field is required and must be a list")
-            return jsonify({"error": "Invalid order data", "message": "Order must contain a list of items"}), 400
-
-        # Validate each item in the 'items' list
-        for item in order_data['items']:
-            if not item.get('product_id'):
-                app.logger.error(f"Invalid order data: Missing 'product_id' in item: {item}")
-                return jsonify({"error": "Invalid order data", "message": "Each item must have a product_id"}), 400
-            if not isinstance(item.get('quantity', 1), int) or item['quantity'] <= 0:
-                app.logger.error(f"Invalid order data: Invalid 'quantity' in item: {item}")
-                return jsonify({"error": "Invalid order data", "message": "Each item must have a positive integer quantity"}), 400
-
-        # Construct headers to forward to the Order Service
-        headers = {
-            'Content-Type': 'application/json',
-            'X-Correlation-ID': g.get('correlation_id', 'N/A'),  # Default to 'N/A' if correlation ID is missing
-            'Authorization': request.headers.get('Authorization')
-        }
-        app.logger.debug(f"Headers sent to Order Service: {headers}")
-
-        # Handle asynchronous order creation
-        if 'callback_url' in order_data:
-            app.logger.info("Processing asynchronous order creation")
-            try:
-                # Send async request to Order Service
-                resp = requests.post(f'{order_service_url}/create_order/async', json=order_data, headers=headers)
-                app.logger.debug(f"Async order service response: {resp.status_code}, {resp.text}")
-
-                if resp.status_code == 202:
-                    publish_order_notification_event(None, customer_id, order_data.get("items"))
-                    app.logger.info("Asynchronous order processing accepted")
-                    return jsonify({"message": "Order processing accepted"}), 202
-                else:
-                    app.logger.error(f"Failed to create order asynchronously: {resp.text}")
-                    return jsonify({"error": "Failed to create order asynchronously", "details": resp.text}), resp.status_code
-            except Exception as e:
-                app.logger.error(f"Error while sending async order request: {str(e)}", exc_info=True)
-                return jsonify({"error": "Failed to process async order", "details": str(e)}), 502
-
-        # Handle synchronous order creation
-        else:
-            app.logger.info("Processing synchronous order creation")
-            try:
-                # Send sync request to Order Service
-                resp = requests.post(f'{order_service_url}/create_order', json=order_data, headers=headers)
-                app.logger.debug(f"Sync order service response: {resp.status_code}, {resp.text}")
-
-                if resp.status_code == 201:
-                    resp_json = resp.json()
-                    app.logger.debug(f"Order Service returned response: {resp_json}")
-
-                    # Extract order_id and total_cost
-                    order_id = resp_json.get("order_id")
-                    total_cost = resp_json.get("total_cost", 0)
-
-                    if not order_id:
-                        app.logger.error("Order ID is missing in response from Order Service")
-                        return jsonify({"error": "Order ID missing in response"}), 500
-
-                    # Deduct customer balance after successful order creation
-                    if total_cost > 0:
-                        try:
-                            balance_deduction_response = requests.post(
-                                f"{customer_service_url}/api/customers/extractBalance",
-                                params={"id": customer_id, "extractNum": total_cost},
-                                timeout=10
-                            )
-                            app.logger.debug(f"Balance deduction response: {balance_deduction_response.status_code}, {balance_deduction_response.text}")
-
-                            if balance_deduction_response.status_code == 200:
-                                app.logger.info(f"Balance deduction successful for customer_id: {customer_id}, amount: {total_cost}")
-                            else:
-                                app.logger.error(
-                                    f"Balance deduction failed for customer_id: {customer_id}, "
-                                    f"status_code: {balance_deduction_response.status_code}, response: {balance_deduction_response.text}"
-                                )
-                                return jsonify({"error": "Balance deduction failed", "details": balance_deduction_response.text}), 400
-                        except requests.exceptions.RequestException as e:
-                            app.logger.error(f"Error during balance deduction for customer_id: {customer_id}: {e}")
-                            return jsonify({"error": "Balance deduction error", "details": str(e)}), 502
-                    else:
-                        app.logger.warning(f"Total cost is zero or invalid for order_id: {order_id}, skipping balance deduction.")
-                    publish_order_notification_event(order_id, customer_id, resp_json.get("items"))
-
-                    response = jsonify(resp_json)
-                    response.status_code = 201
-                    response.headers['Location'] = f"{baseurl}/customer/{customer_id}/orders/{order_id}"
-                    return response
-                else:
-                    app.logger.error(f"Failed to create order: {resp.text}")
-                    return jsonify({"error": "Failed to create order", "details": resp.text}), resp.status_code
-            except Exception as e:
-                app.logger.error(f"Error while sending sync order request: {str(e)}", exc_info=True)
-                return jsonify({"error": "Failed to process sync order", "details": str(e)}), 502
-
-    except Exception as e:
-        app.logger.error(f"Unexpected error in create_customer_order: {str(e)}", exc_info=True)
-        return jsonify({"error": "An internal server error occurred"}), 500
-'''
-'''
-# view single order by id   
-@app.route('/customer/<int:customer_id>/orders/<int:order_id>', methods=['GET'])
-@jwt_required()
-@grants_required('view_order')
-def get_single_order(customer_id, order_id):
+    if request.content_type != 'application/json':
+        return jsonify({"error": "Unsupported Media Type", "message": "Use application/json"}), 415
     if not order_service_url:
         return jsonify({"error": "Order service URL is not configured"}), 500
 
+    order_data = request.get_json(force=True)
+    order_data['customer_id'] = customer_id
+
     headers = {
+        'Content-Type': 'application/json',
         'X-Correlation-ID': g.correlation_id,
         'Authorization': request.headers.get('Authorization')
     }
+    #Composition using code and asynchronous API calls
+    if 'callback_url' in order_data:
+        try:
+            # Log the asynchronous order creation attempt
+            app.logger.info(f"Asynchronous order creation triggered for customer_id: {customer_id}")
 
-    response = requests.get(f'{order_service_url}/orders/{order_id}', headers=headers)
-    if response.status_code == 200:
-        order_info = response.json()
-        if '_links' not in order_info:
-            order_info['_links'] = {
-                "self": {"href": request.url},
-                "customer": {"href": f"{baseurl}/customer/{customer_id}"}
-            }
-        return jsonify(order_info), 200
-    elif response.status_code == 404:
-        return jsonify({'error': 'Order not found'}), 404
+            # Send the async request to the order service
+            resp = requests.post(f'{order_service_url}/create_order/async', json=order_data, headers=headers)
+
+            if resp.status_code == 202:
+                app.logger.info("Asynchronous order creation accepted by order service")
+
+                # Optionally trigger a step function workflow if needed
+                call_step_function_workflow(None)  # Pass actual data if necessary
+
+                # Construct response headers
+                response = jsonify({"message": "Order processing accepted"})
+                response.status_code = 202
+                response.headers['Authorization'] = request.headers.get('Authorization', '')
+                response.headers['Grants'] = request.headers.get('Grants', '')
+                return response
+            else:
+                # Log and return error if async creation fails
+                app.logger.error(f"Failed to create order asynchronously: {resp.text}")
+                return jsonify({"error": "Failed to create order asynchronously", "details": resp.text}), resp.status_code
+
+        except Exception as e:
+            # Log unexpected errors during the asynchronous call
+            app.logger.critical(f"Unexpected error during async order creation: {str(e)}", exc_info=True)
+            return jsonify({"error": "An internal server error occurred during async order creation"}), 500
+
+    # Composition using code and synchronous API calls
     else:
-        return jsonify({'error': 'Failed to retrieve order', 'details': response.text}), response.status_code
+        try:
+            # Log the endpoint invocation
+            app.logger.debug(f"create_customer_order endpoint called for customer_id: {customer_id}")
+
+            # Check if the Content-Type is application/json
+            if request.content_type != 'application/json':
+               app.logger.warning(f"Unsupported Media Type: Received Content-Type: {request.content_type}")
+               return jsonify({"error": "Unsupported Media Type", "message": "Use application/json"}), 415
+
+            # Parse the JSON payload
+            try:
+               order_data = request.get_json(force=True)
+               app.logger.info(f"Order data received: {order_data}")
+            except Exception as e:
+               app.logger.warning(f"Failed to parse JSON from request body: {str(e)}", exc_info=True)
+               return jsonify({"error": "Invalid JSON payload", "message": "Request body must be valid JSON"}), 400
+
+            # Ensure `items` are included in the payload and validate their structure
+            if not order_data.get("items") or not isinstance(order_data["items"], list):
+               return jsonify({"error": "Invalid input", "message": "'items' field must be a list"}), 400
+
+            # Validate that each item contains the required fields
+            for item in order_data["items"]:
+                if not all(key in item for key in ["product_id", "quantity", "price"]):
+                   return jsonify({
+                      "error": "Invalid input",
+                      "message": "Each item must include 'product_id', 'quantity', and 'price'"
+                    }), 400
+
+            # Add customer_id to the payload
+            order_data["customer_id"] = customer_id
+
+            # Ensure the payload includes the required fields for the workflow
+            order_data.setdefault("status", "Pending")  # Default status
+            order_data.setdefault("tracking_number", "")  # Default empty tracking number
+
+            # Log the validated order data
+            app.logger.info(f"Validated order data: {order_data}")
+
+            # Trigger Google Cloud Workflow
+            workflow_response, status_code = call_step_function_workflow(order_data)
+
+            # Handle workflow response
+            if status_code not in [200, 202]:
+               app.logger.error(f"Workflow invocation failed: {workflow_response.get('error')}")
+               return jsonify({"error": "Workflow invocation failed", "details": workflow_response.get("error")}), 502
+
+            # Extract the order_id from the workflow response
+            order_id = workflow_response.get("order_id")
+            if not order_id:
+               app.logger.error("Workflow response did not contain order_id")
+               return jsonify({"error": "Workflow response error", "message": "Missing order_id in response"}), 500
+
+            # Publish an order notification event (optional)
+            publish_order_notification_event(order_id, customer_id, order_data.get("items"))
+            app.logger.info(f"Order notification published for order_id: {order_id}")
+
+            # Return the workflow result as the response with headers
+            response = jsonify({"message": "Order created successfully", "order_id": order_id})
+            response.status_code = 201
+            response.headers['Authorization'] = request.headers.get('Authorization', '')
+            response.headers['Grants'] = request.headers.get('Grants', '')
+            response.headers['Location'] = f"{baseurl}/customer/{customer_id}/orders/{order_id}"
+            return response
+
+        except Exception as e:
+            app.logger.critical(f"Unexpected error in create_customer_order: {str(e)}", exc_info=True)
+            return jsonify({"error": "An internal server error occurred"}), 500
+
 
 @app.route('/customer/<int:customer_id>/orders/<int:order_id>/status', methods=['GET'])
 @jwt_required()
@@ -902,7 +753,6 @@ def get_async_order_status(customer_id, order_id):
     else:
         return jsonify({'error': 'Failed to retrieve order status', 'details': response.text}), response.status_code
 
-'''
 # view all orders
 @app.route('/customer/orders/<int:customer_id>', methods=['GET'])
 @jwt_required()
@@ -986,7 +836,6 @@ def test_discord():
     #trigger_end_user_notification(order_id=999)
     return jsonify({"message": "Discord notification test triggered"}), 200
 
-
 class ProductType(ObjectType):
     product_id = Int()
     name = String()
@@ -1012,7 +861,7 @@ schema = make_executable_schema("""
         hello: String!
     }
 """, query)
-
+# GraphQL Integration
 @app.route('/graphql', methods=["GET", "POST"])
 def graphql_server():
     if request.method == "GET":
@@ -1047,7 +896,6 @@ def graphql_server():
 #######################################
 # ORDER TRACKING 
 #######################################
-import json
 
 TRACKINGMORE_API_KEY = os.getenv('TRACKINGMORE_API_KEY', 'ti6225pj-2o0k-11tw-l588-w41y04dx9s4l')  # Update if needed
 

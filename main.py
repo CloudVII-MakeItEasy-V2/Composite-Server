@@ -37,7 +37,8 @@ app.secret_key = os.getenv('SECRET_KEY', 'default_secret')
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'default_jwt_secret')
 jwt = JWTManager(app)
 # Path to your service account key file
-key_file = "service-account-key.json"
+with open('service-account-key.json') as f:
+    key_file = json.load(f)
 
 # Service URLs
 order_service_url = os.getenv("MICROSERVICE2_ORDER_SERVICE_URL", "").strip()

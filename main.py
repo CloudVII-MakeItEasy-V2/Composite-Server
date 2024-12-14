@@ -17,6 +17,7 @@ from graphql import graphql_sync
 from graphene import ObjectType, String, Int, List
 import base64
 import json
+from google.cloud import storage, secretmanager
 
 
 # Load environment variables
@@ -36,9 +37,21 @@ CORS(
 app.secret_key = os.getenv('SECRET_KEY', 'default_secret')
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'default_jwt_secret')
 jwt = JWTManager(app)
-# Path to your service account key file
-with open('service-account-key.json') as f:
-    key_file = json.load(f)
+
+client = secretmanager.SecretManagerServiceClient()
+
+# Access the secret
+secret_name = "projects/makeiteasy-440104/secrets/my-service-account-key/versions/latest"
+response = client.access_secret_version(name=secret_name)
+secret_data = response.payload.data.decode("UTF-8")
+
+# Write the secret to a temporary file
+with open("service-account-key.json", "w") as f:
+    f.write(secret_data)
+
+# Use the key file in your application
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "service-account-key.json"
+GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
 # Service URLs
 order_service_url = os.getenv("MICROSERVICE2_ORDER_SERVICE_URL", "").strip()
@@ -59,7 +72,6 @@ GOOGLE_PUBSUB_TOPIC = os.getenv('GOOGLE_PUBSUB_TOPIC')
 publisher = pubsub_v1.PublisherClient()
 topic_path = "projects/makeiteasy-440104/topics/order-publishing"
 GCP_WORKFLOW_URL = os.getenv('GCP_WORKFLOW_URL')
-GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
 # Initialize Pub/Sub publisher
 pubsub_publisher = pubsub_v1.PublisherClient()
@@ -424,7 +436,7 @@ def call_step_function_workflow(order_data):
         try:
             # Authenticate with Google Cloud using the service account key file
             credentials = service_account.Credentials.from_service_account_file(
-                key_file,
+                GOOGLE_APPLICATION_CREDENTIALS,
                 scopes=["https://www.googleapis.com/auth/cloud-platform"]
             )
 
@@ -451,7 +463,7 @@ def call_step_function_workflow(order_data):
 
             # Start the workflow execution
             response = requests.post(GCP_WORKFLOW_URL, json=workflow_payload, headers=headers)
-
+            os.remove("service-account-key.json")
             # Check if the response status code indicates success
             if response.status_code not in [200, 202]:
                 logger.error(f"Workflow failed to start: {response.text}")

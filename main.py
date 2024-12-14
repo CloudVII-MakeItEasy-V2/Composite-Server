@@ -10,15 +10,13 @@ from functools import wraps
 from flask import Flask, request, jsonify, g
 from ariadne import graphql_sync, make_executable_schema, QueryType
 from google.cloud import pubsub_v1  # Google Cloud Pub/Sub
-from google.oauth2 import id_token  # For Google Workflows
 from google.oauth2 import service_account
-import google.auth.transport.requests
+from google.oauth2.service_account import Credentials
+from google.auth.transport.requests import Request
 from graphql import graphql_sync
 from graphene import ObjectType, String, Int, List
 import base64
 import json
-from google.cloud import storage, secretmanager
-
 
 # Load environment variables
 load_dotenv()
@@ -38,20 +36,7 @@ app.secret_key = os.getenv('SECRET_KEY', 'default_secret')
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'default_jwt_secret')
 jwt = JWTManager(app)
 
-client = secretmanager.SecretManagerServiceClient()
 
-# Access the secret
-secret_name = "projects/makeiteasy-440104/secrets/my-service-account-key/versions/latest"
-response = client.access_secret_version(name=secret_name)
-secret_data = response.payload.data.decode("UTF-8")
-
-# Write the secret to a temporary file
-with open("service-account-key.json", "w") as f:
-    f.write(secret_data)
-
-# Use the key file in your application
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "service-account-key.json"
-GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
 # Service URLs
 order_service_url = os.getenv("MICROSERVICE2_ORDER_SERVICE_URL", "").strip()
@@ -65,16 +50,37 @@ SMART_STREET_NAME = os.getenv('SMART_STREET_NAME', 'makeiteasy')
 
 DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL')
 
+# Load the credentials JSON from an environment variable
+credentials_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+if not credentials_json:
+    raise Exception("Environment variable GOOGLE_APPLICATION_CREDENTIALS_JSON is not set.")
+
+# Parse the JSON string
+try:
+    credentials_info = json.loads(credentials_json)
+except json.JSONDecodeError as e:
+    raise Exception("Invalid JSON in GOOGLE_APPLICATION_CREDENTIALS_JSON") from e
+
+# Define the required OAuth scopes
+scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+
+# Initialize the credentials object with the scopes
+credentials = Credentials.from_service_account_info(credentials_info, scopes=scopes)
+
+# Refresh the credentials to fetch an access token
+auth_request = Request()
+credentials.refresh(auth_request)
+# Access the token for triggering workflows
+access_token = credentials.token
+
 baseurl = 'https://makeiteasy-440104.appspot.com'
 
 # Google Cloud Pub/Sub and Workflows
 GOOGLE_PUBSUB_TOPIC = os.getenv('GOOGLE_PUBSUB_TOPIC')
-publisher = pubsub_v1.PublisherClient()
+publisher = pubsub_v1.PublisherClient(credentials=credentials)
 topic_path = "projects/makeiteasy-440104/topics/order-publishing"
 GCP_WORKFLOW_URL = os.getenv('GCP_WORKFLOW_URL')
 
-# Initialize Pub/Sub publisher
-pubsub_publisher = pubsub_v1.PublisherClient()
 
 def issue_token(identity='guest'):
     """
@@ -434,17 +440,6 @@ def poll_workflow_execution(execution_name, headers, max_retries=30, sleep_time=
 def call_step_function_workflow(order_data):
     if GCP_WORKFLOW_URL:
         try:
-            # Authenticate with Google Cloud using the service account key file
-            credentials = service_account.Credentials.from_service_account_file(
-                GOOGLE_APPLICATION_CREDENTIALS,
-                scopes=["https://www.googleapis.com/auth/cloud-platform"]
-            )
-
-            # Refresh the credentials to get an OAuth 2.0 access token
-            auth_request = google.auth.transport.requests.Request()
-            credentials.refresh(auth_request)
-            access_token = credentials.token
-
             # Prepare headers with the OAuth 2.0 access token
             headers = {
                 "Authorization": f"Bearer {access_token}",
@@ -463,7 +458,6 @@ def call_step_function_workflow(order_data):
 
             # Start the workflow execution
             response = requests.post(GCP_WORKFLOW_URL, json=workflow_payload, headers=headers)
-            os.remove("service-account-key.json")
             # Check if the response status code indicates success
             if response.status_code not in [200, 202]:
                 logger.error(f"Workflow failed to start: {response.text}")

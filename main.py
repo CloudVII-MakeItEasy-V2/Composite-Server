@@ -50,6 +50,7 @@ SMART_STREET_NAME = os.getenv('SMART_STREET_NAME', 'makeiteasy')
 DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL')
 
 # Load the credentials JSON from an environment variable
+#credentials_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
 credentials_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
 if not credentials_json:
     raise Exception("Environment variable GOOGLE_APPLICATION_CREDENTIALS_JSON is not set.")

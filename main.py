@@ -10,7 +10,6 @@ from functools import wraps
 from flask import Flask, request, jsonify, g
 from ariadne import graphql_sync, make_executable_schema, QueryType
 from google.cloud import pubsub_v1  # Google Cloud Pub/Sub
-from google.oauth2 import service_account
 from google.oauth2.service_account import Credentials
 from google.auth.transport.requests import Request
 from graphql import graphql_sync
@@ -520,37 +519,166 @@ def notify_via_pubsub(event, context):
 ##########################
 # SELLER INTEGRATION
 ##########################
+
 @app.route('/seller/register', methods=['POST'])
-@jwt_required()
-@grants_required('register_seller')
 def register_seller():
-    if request.content_type != 'application/json':
-        return jsonify({"error": "Unsupported Media Type", "message": "Use application/json"}), 415
-    if not seller_service_url:
-        return jsonify({"error": "Seller service URL is not configured"}), 500
+    try:
+        logging.info("Received seller registration request")
 
-    data = request.get_json(force=True)
-    name = data.get('name')
-    email = data.get('email')
-    if not name or not email:
-        return jsonify({"error": "Name and email are required"}), 400
+        # Validate Content-Type
+        if request.content_type != 'application/json':
+            return jsonify({"error": "Unsupported Media Type", "message": "Use application/json"}), 415
 
-    headers = {
-        'Content-Type': 'application/json',
-        'X-Correlation-ID': g.correlation_id,
-        'Authorization': request.headers.get('Authorization')
-    }
+        # Parse the JSON request payload
+        data = request.get_json(force=True)
+        name = data.get('name')
+        email = data.get('email')
+        password_hash = data.get('password_hash')
+        balance = data.get('balance', 0.0)
+        phone_number = data.get('phone_number', '')
+        address = data.get('address', '')
 
-    response = requests.post(f'{seller_service_url}/seller/register', json=data, headers=headers)
-    if response.status_code == 201:
-        resp_json = response.json()
-        seller_id = resp_json['seller']['id']
-        resp = jsonify(resp_json)
-        resp.status_code = 201
-        resp.headers['Location'] = f"{baseurl}/seller/{seller_id}"
-        return resp
-    else:
-        return jsonify({"error": "Failed to register seller", "details": response.text}), response.status_code
+        # Validate required fields
+        if not all([name, email, password_hash]):
+            logging.error("Missing required fields in registration request")
+            return jsonify({"error": "Name, email, and password are required"}), 400
+
+        # Ensure Seller Service URL is configured
+        if not seller_service_url:
+            logging.error("Seller Service URL is not configured")
+            return jsonify({"error": "Seller service URL is not configured"}), 500
+
+        # Prepare the payload for the Seller Service
+        seller_service_payload = {
+            "name": name,
+            "email": email,
+            "password_hash": password_hash,
+            "balance": balance,
+            "phone_number": phone_number,
+            "address": address
+        }
+
+        logging.info(f"Forwarding registration request to Seller Service for email: {email}")
+        headers = {'Content-Type': 'application/json'}
+        response = requests.post(
+            f"{seller_service_url}/seller/register",
+            json=seller_service_payload,
+            headers=headers
+        )
+
+        logging.info(f"Seller Service Response: {response.status_code} - {response.text}")
+
+        # Handle Seller Service response
+        if response.status_code == 201:
+            try:
+                response_data = response.json()
+            except requests.exceptions.JSONDecodeError:
+                logging.error("Failed to parse Seller Service response as JSON")
+                return jsonify({"error": "Invalid response from Seller Service"}), 500
+
+            # Issue token and grants
+            auth = issue_token(email)
+            access_token = auth['access_token']
+            all_grants = auth['all_grants']
+
+            # Return response with token and grants
+            resp = jsonify({
+                "message": "Registration successful",
+                "seller": response_data
+            })
+            resp.headers['Authorization'] = f"Bearer {access_token}"
+            resp.headers['X-Grants'] = ','.join(all_grants)
+            return resp, 201
+
+        elif response.status_code == 400:
+            logging.warning("Validation error from Seller Service")
+            return jsonify({"error": response.json().get("error", "Validation error")}), 400
+
+        elif response.status_code == 409:
+            logging.warning("Conflict error from Seller Service")
+            return jsonify({"error": "Seller with this email already exists"}), 409
+
+        else:
+            logging.error(f"Unexpected error from Seller Service: {response.text}")
+            return jsonify({"error": f"Unexpected error: {response.text}"}), response.status_code
+
+    except Exception as e:
+        logging.error(f"Error in register_seller: {str(e)}", exc_info=True)
+        return jsonify({"error": "An internal server error occurred"}), 500
+    
+@app.route('/seller/login', methods=['POST'])
+def login_seller():
+    try:
+        logging.info("Received seller login request")
+
+        # Validate Content-Type
+        if 'application/json' not in request.content_type:
+            logging.error("Invalid Content-Type")
+            return jsonify({"error": "Unsupported Media Type", "message": "Use application/json"}), 415
+
+        # Parse JSON payload
+        data = request.get_json(silent=True)
+        if not data:
+            logging.error("Invalid JSON payload")
+            return jsonify({"error": "Invalid JSON payload"}), 400
+
+        # Extract email and password from payload
+        email = data.get('email')
+        password = data.get('password')
+
+        if not email or not password:
+            logging.error("Missing email or password")
+            return jsonify({"error": "Email and password are required"}), 400
+
+        # Ensure the seller service URL is configured
+        if not seller_service_url:
+            logging.error("Seller Service URL is not configured")
+            return jsonify({"error": "Seller service URL is not configured"}), 500
+
+        logging.info(f"Forwarding login request to Seller Service: {seller_service_url}/seller/login")
+
+        # Forward request to the Seller Service
+        response = requests.post(
+            f"{seller_service_url}/seller/login",
+            json={"email": email, "password": password},
+            timeout=5
+        )
+
+        logging.info(f"Seller Service Response: {response.status_code} - {response.text}")
+
+        # Handle Seller Service response
+        if response.status_code == 200:
+            try:
+                response_data = response.json()
+            except requests.exceptions.JSONDecodeError:
+                logging.error("Failed to parse Seller Service response as JSON")
+                return jsonify({"error": "Invalid response from Seller Service"}), 500
+
+            # Issue token and grants
+            auth = issue_token(email)
+            access_token = auth['access_token']
+            all_grants = auth['all_grants']
+
+            # Return response with token and grants
+            resp = jsonify({
+                "message": response_data.get("message", "Login successful"),
+                "seller": response_data,
+            })
+            resp.headers['Authorization'] = f"Bearer {access_token}"
+            resp.headers['X-Grants'] = ','.join(all_grants)
+            return resp, 200
+
+        elif response.status_code == 401:
+            logging.warning("Unauthorized seller login attempt")
+            return jsonify({"error": "Invalid email or password"}), 401
+
+        else:
+            logging.error(f"Unexpected error from Seller Service: {response.text}")
+            return jsonify({"error": "An unexpected error occurred."}), 500
+
+    except Exception as e:
+        logging.error(f"Error in login_seller: {str(e)}", exc_info=True)
+        return jsonify({"error": "An internal server error occurred"}), 500
 
 @app.route('/seller/<int:seller_id>/products', methods=['POST'])
 @jwt_required()

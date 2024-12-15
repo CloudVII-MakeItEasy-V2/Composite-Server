@@ -39,7 +39,8 @@ jwt = JWTManager(app)
 
 # Service URLs
 order_service_url = os.getenv("MICROSERVICE2_ORDER_SERVICE_URL", "").strip()
-seller_service_url = os.getenv('MICROSERVICE3_SELLER_SERVICE_URL')
+seller_service_url = os.getenv('MIRCROSERVICE3_SELLER_SERVICE_URL')
+print(f"DEBUG: Seller Service URL in Flask: {seller_service_url}")
 customer_service_url = os.getenv('MIRCROSERVICE1_CUSTOMER_SERVICE_URL')
 
 SMART_STREET_API_URL = os.getenv('SMART_STREET_API_URL', 'https://api.smartystreets.com/street-address')
